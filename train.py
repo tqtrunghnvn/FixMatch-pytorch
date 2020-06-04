@@ -22,7 +22,11 @@ from tqdm import tqdm
 from dataset.cifar import get_cifar10, get_cifar100
 from utils import AverageMeter, accuracy
 
-logger = logging.getLogger(__name__)
+from function import batchhard, batchhard2, create_logger
+
+#logger = logging.getLogger(__name__)
+time_str = time.strftime('%Y-%m-%d-%H-%M')
+logger = create_logger('.', 'fixandtrip', time_str)
 
 DATASET_GETTERS = {'cifar10': get_cifar10,
                    'cifar100': get_cifar100}
@@ -282,13 +286,16 @@ def main():
     model.zero_grad()
     for epoch in range(start_epoch, args.epochs):
 
-        train_loss, train_loss_x, train_loss_u, mask_prob = train(
+        train_loss, train_loss_x, train_loss_u, train_loss_tripu, mask_prob = train(
             args, labeled_trainloader, unlabeled_trainloader,
             model, optimizer, ema_model, scheduler, epoch)
 
         if args.no_progress:
-            logger.info("Epoch {}. train_loss: {:.4f}. train_loss_x: {:.4f}. train_loss_u: {:.4f}."
-                        .format(epoch+1, train_loss, train_loss_x, train_loss_u))
+            logger.info("Epoch {}. train_loss: {:.4f}. train_loss_x: {:.4f}. train_loss_u: {:.4f}. train_loss_tripu: {:.4f}"
+                        .format(epoch+1, train_loss, train_loss_x, train_loss_u, train_loss_tripu))
+
+        logger.info("Epoch {}. train_loss: {:.4f}. train_loss_x: {:.4f}. train_loss_u: {:.4f}. train_loss_tripu: {:.4f}"
+                        .format(epoch+1, train_loss, train_loss_x, train_loss_u, train_loss_tripu))
 
         if args.use_ema:
             test_model = ema_model.ema
@@ -301,6 +308,7 @@ def main():
             writer.add_scalar('train/1.train_loss', train_loss, epoch)
             writer.add_scalar('train/2.train_loss_x', train_loss_x, epoch)
             writer.add_scalar('train/3.train_loss_u', train_loss_u, epoch)
+            writer.add_scalar('train/3.train_loss_tripu', train_loss_tripu, epoch)
             writer.add_scalar('train/4.mask', mask_prob, epoch)
             writer.add_scalar('test/1.test_acc', test_acc, epoch)
             writer.add_scalar('test/2.test_loss', test_loss, epoch)
@@ -340,6 +348,7 @@ def train(args, labeled_trainloader, unlabeled_trainloader,
     losses = AverageMeter()
     losses_x = AverageMeter()
     losses_u = AverageMeter()
+    losses_tripu = AverageMeter()
     end = time.time()
 
     if not args.no_progress:
@@ -355,7 +364,7 @@ def train(args, labeled_trainloader, unlabeled_trainloader,
         batch_size = inputs_x.shape[0]
         inputs = torch.cat((inputs_x, inputs_u_w, inputs_u_s)).to(args.device)
         targets_x = targets_x.to(args.device)
-        logits = model(inputs)
+        logits, feas = model(inputs)
         logits_x = logits[:batch_size]
         logits_u_w, logits_u_s = logits[batch_size:].chunk(2)
         del logits
@@ -369,7 +378,22 @@ def train(args, labeled_trainloader, unlabeled_trainloader,
         Lu = (F.cross_entropy(logits_u_s, targets_u,
                               reduction='none') * mask).mean()
 
-        loss = Lx + args.lambda_u * Lu
+
+
+        _, fea_u_s = feas[batch_size:].chunk(2)
+        fea_u_s = F.normalize(fea_u_s, p=2, dim=1)
+        feas = fea_u_s[mask==1]
+        idens = targets_u[mask==1]
+        idens = idens.cuda()
+
+        if idens.nelement() == 0:
+            Ltripu = torch.zeros(()).cuda()
+        else:
+            Ltripu = batchhard(feas, idens)
+
+
+
+        loss = Lx + args.lambda_u * (Lu + Ltripu)
 
         if args.amp:
             with amp.scale_loss(loss, optimizer) as scaled_loss:
@@ -380,6 +404,7 @@ def train(args, labeled_trainloader, unlabeled_trainloader,
         losses.update(loss.item())
         losses_x.update(Lx.item())
         losses_u.update(Lu.item())
+        losses_tripu.update(Ltripu.item())
 
         optimizer.step()
         scheduler.step()
@@ -391,7 +416,7 @@ def train(args, labeled_trainloader, unlabeled_trainloader,
         end = time.time()
         mask_prob = mask.mean().item()
         if not args.no_progress:
-            p_bar.set_description("Train Epoch: {epoch}/{epochs:4}. Iter: {batch:4}/{iter:4}. LR: {lr:.6f}. Data: {data:.3f}s. Batch: {bt:.3f}s. Loss: {loss:.4f}. Loss_x: {loss_x:.4f}. Loss_u: {loss_u:.4f}. Mask: {mask:.4f}. ".format(
+            p_bar.set_description("Train Epoch: {epoch}/{epochs:4}. Iter: {batch:4}/{iter:4}. LR: {lr:.6f}. Data: {data:.3f}s. Batch: {bt:.3f}s. Loss: {loss:.4f}. Loss_x: {loss_x:.4f}. Loss_u: {loss_u:.4f}. Loss_tripu: {loss_tripu:.4f}. Mask: {mask:.4f}. ".format(
                 epoch=epoch + 1,
                 epochs=args.epochs,
                 batch=batch_idx + 1,
@@ -403,11 +428,12 @@ def train(args, labeled_trainloader, unlabeled_trainloader,
                 loss=losses.avg,
                 loss_x=losses_x.avg,
                 loss_u=losses_u.avg,
+                loss_tripu=losses_tripu.avg,
                 mask=mask_prob))
             p_bar.update()
     if not args.no_progress:
         p_bar.close()
-    return losses.avg, losses_x.avg, losses_u.avg, mask_prob
+    return losses.avg, losses_x.avg, losses_u.avg, losses_tripu.avg, mask_prob
 
 
 def test(args, test_loader, model, epoch):
@@ -429,7 +455,7 @@ def test(args, test_loader, model, epoch):
 
             inputs = inputs.to(args.device)
             targets = targets.to(args.device)
-            outputs = model(inputs)
+            outputs, _ = model(inputs)
             loss = F.cross_entropy(outputs, targets)
 
             prec1, prec5 = accuracy(outputs, targets, topk=(1, 5))
