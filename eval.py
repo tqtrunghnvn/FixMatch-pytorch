@@ -277,7 +277,7 @@ def test(args, test_loader, model, epoch):
 
             inputs = inputs.to(args.device)
             targets = targets.to(args.device)
-            outputs = model(inputs)
+            outputs, _ = model(inputs)
             loss = F.cross_entropy(outputs, targets)
 
             prec1, prec5 = accuracy(outputs, targets, topk=(1, 5))
